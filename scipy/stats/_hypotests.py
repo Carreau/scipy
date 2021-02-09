@@ -892,12 +892,22 @@ def barnard_exact(table, alternative="two-sided", pooled=True, n_iter=1):
         )
         raise ValueError(msg)
 
+    n = total_c1 + total_c2
+    x1 = np.arange(total_c1 + 1, dtype=np.int64).reshape(-1, 1, 1)
+    x2 = np.arange(total_c2 + 1, dtype=np.int64).reshape(1, -1, 1)
+    x1_sum_x2 = x1 + x2
+
+    x1_log_comb = _compute_log_combinations(total_c1)
+    x2_log_comb = _compute_log_combinations(total_c2)
+    x1_sum_x2_log_comb = x1_log_comb[x1] + x2_log_comb[x2]
+
     get_pvalue_from = _binomial_maximisation_of_p_value_with_nuisance_param(
         total_col_1, total_col_2, index_arr
     )
 
     result = shgo(
-        get_pvalue_from,
+        _binomial_maximisation_of_p_value_with_nuisance_param,
+        args=(x1_sum_x2, x1_sum_x2_log_comb, index_arr)
         bounds=((0, 1),),
         n=32,  # Need to be a power of two since it is used by sobol
         sampling_method="sobol",
@@ -908,17 +918,17 @@ def barnard_exact(table, alternative="two-sided", pooled=True, n_iter=1):
     return BarnardExactResult(wald_stat_obs, p_value)
 
 
-def _binomial_maximisation_of_p_value_with_nuisance_param(
-        total_c1, total_c2, index_arr
-):
+
+def _binomial_maximisation_of_p_value_with_nuisance_param(nuisance_param, x1_sum_x2, x1_sum_x2_log_comb, index_arr):
     r"""
     Maximisation of the pvalue in respect of a nuisance parameter considering
     a 2x2 sample space using the `scipy.optimize.shgo` algorithm.
 
     Parameters
     ----------
-     total_c1, total_c2: int
-        The total sum of column 1 and column 2 in the initial variables array
+    # incorrect now
+    #  total_c1, total_c2: int
+    #     The total sum of column 1 and column 2 in the initial variables array
 
     index_arr: ndarray of boolean
 
@@ -941,52 +951,40 @@ def _binomial_maximisation_of_p_value_with_nuisance_param(
     a log combination. For the little precision lost, we gain a lot of
     performance.
     """
-    n = total_c1 + total_c2
-    x1 = np.arange(total_c1 + 1, dtype=np.int64).reshape(-1, 1, 1)
-    x2 = np.arange(total_c2 + 1, dtype=np.int64).reshape(1, -1, 1)
-    x1_sum_x2 = x1 + x2
+    with np.errstate(divide="ignore", invalid="ignore"):
+        log_nuisance = np.log(
+            nuisance_param,
+            out=np.zeros_like(nuisance_param),
+            where=nuisance_param >= 0,
+        )
+        log_1_minus_nuisance = np.log(
+            1 - nuisance_param,
+            out=np.zeros_like(nuisance_param),
+            where=1 - nuisance_param >= 0,
+        )
 
-    x1_log_comb = _compute_log_combinations(total_c1)
-    x2_log_comb = _compute_log_combinations(total_c2)
-    x1_sum_x2_log_comb = x1_log_comb[x1] + x2_log_comb[x2]
+        nuisance_power_x1_x2 = log_nuisance * (x1_sum_x2)
+        nuisance_power_x1_x2[(x1_sum_x2 == 0)[:, :, 0]] = 0
 
-    def get_pvalue_from(nuisance_param):
-        with np.errstate(divide="ignore", invalid="ignore"):
-            log_nuisance = np.log(
-                nuisance_param,
-                out=np.zeros_like(nuisance_param),
-                where=nuisance_param >= 0,
-            )
-            log_1_minus_nuisance = np.log(
-                1 - nuisance_param,
-                out=np.zeros_like(nuisance_param),
-                where=1 - nuisance_param >= 0,
-            )
+        nuisance_power_n_minus_x1_x2 = log_1_minus_nuisance * (
+                n - x1_sum_x2
+        )
+        nuisance_power_n_minus_x1_x2[(x1_sum_x2 == n)[:, :, 0]] = 0
 
-            nuisance_power_x1_x2 = log_nuisance * (x1_sum_x2)
-            nuisance_power_x1_x2[(x1_sum_x2 == 0)[:, :, 0]] = 0
+        tmp_values_arr = np.exp(
+            x1_sum_x2_log_comb
+            + nuisance_power_x1_x2
+            + nuisance_power_n_minus_x1_x2
+        )
 
-            nuisance_power_n_minus_x1_x2 = log_1_minus_nuisance * (
-                    n - x1_sum_x2
-            )
-            nuisance_power_n_minus_x1_x2[(x1_sum_x2 == n)[:, :, 0]] = 0
+    tmp_values_arr /= tmp_values_arr.sum(axis=(0, 1)).reshape(1, 1, -1)
+    # This operation compensate numerical errors because sums of
+    # p_values_arr should always be equal to one.
 
-            tmp_values_arr = np.exp(
-                x1_sum_x2_log_comb
-                + nuisance_power_x1_x2
-                + nuisance_power_n_minus_x1_x2
-            )
+    p_values_arr = tmp_values_arr[index_arr].sum(axis=0)
+    max_pvalue_index = p_values_arr.argmax()
 
-        tmp_values_arr /= tmp_values_arr.sum(axis=(0, 1)).reshape(1, 1, -1)
-        # This operation compensate numerical errors because sums of
-        # p_values_arr should always be equal to one.
-
-        p_values_arr = tmp_values_arr[index_arr].sum(axis=0)
-        max_pvalue_index = p_values_arr.argmax()
-
-        # Since shgo find the minima, we need to take the negative value of the
-        # pvalue
-        p_value = p_values_arr[max_pvalue_index]  # take the max value
-        return - p_value
-
-    return get_pvalue_from
+    # Since shgo find the minima, we need to take the negative value of the
+    # pvalue
+    p_value = p_values_arr[max_pvalue_index]  # take the max value
+    return - p_value
